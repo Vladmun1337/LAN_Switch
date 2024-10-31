@@ -110,27 +110,27 @@ def main():
 
         if vlan_id == -1:
             vlan_id = VLAN_table[interface]
-            data = data[0:12] + create_vlan_tag(vlan_id) + data[12:]
+            tagged = data[0:12] + create_vlan_tag(vlan_id) + data[12:]
             length += 4
 
         # TODO: Implement forwarding with learning
+        if src_mac not in MAC_table:
+            MAC_table[src_mac] = interface
 
         if is_unicast(dest_mac_byte) and dest_mac in MAC_table:
             if VLAN_table[MAC_table[dest_mac]] == 'T':
-                send_to_link(MAC_table[dest_mac], length, data)
+                send_to_link(MAC_table[dest_mac], length, tagged)
             elif VLAN_table[MAC_table[dest_mac]] == vlan_id:
-                data = data[0:12] + data[16:]
-                length -= 4
-                send_to_link(MAC_table[dest_mac], length, data)
+                untagged = tagged[0:12] + tagged[16:]
+                send_to_link(MAC_table[dest_mac], length-4, untagged)
         else:
             for i in interfaces:
                 if i != interface:
                     if VLAN_table[i] == 'T':
-                        send_to_link(i, length, data)
+                        send_to_link(i, length, tagged)
                     elif VLAN_table[i] == vlan_id:
-                        data = data[0:12] + data[16:]
-                        length -= 4
-                        send_to_link(i, length, data)
+                        untagged = tagged[0:12] + tagged[16:]
+                        send_to_link(i, length-4, untagged)
 
         # TODO: Implement VLAN support
         # TODO: Implement STP support
