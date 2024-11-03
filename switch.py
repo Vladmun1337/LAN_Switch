@@ -48,7 +48,7 @@ def build_bdpu_ether(root, sender, cost):
 
 def send_bdpu_every_sec(is_root, interfaces, bridge_ID, VLAN_table):
     while True:
-        # TODO Send BDPU every second if necessary
+        # Send BDPU every second on all trunks
         if is_root:
             bpdu = build_bdpu_ether(bridge_ID, bridge_ID, 0)
 
@@ -63,17 +63,16 @@ def is_unicast(addr):
     # check if least significant bit of most significant Byte is 0
     return (addr[0] & 1) == 0
 
-def parse_vlan_data(interfaces, path):
-    priority = -1
-    VLAN_table = {}
+def read_switch_config(switch_id, interfaces):
 
+    VLAN_table = {}
     # Read vlan data from config file
-    with open(path, "r") as f:
+    with open(f"configs/switch{switch_id}.cfg", "r") as f:
         priority = int(f.readline().strip())
 
         for line in f:
-            name = line.strip().split(' ')
-            VLAN_table[name[0]] = int(name[1]) if name[1] != 'T' else 'T'
+            name, vlan = line.strip().split(' ')
+            VLAN_table[name] = int(vlan) if vlan != 'T' else 'T'
     
     new_table = {}
     # Associate interface to VLAN
@@ -94,25 +93,19 @@ def main():
     print("# Starting switch with id {}".format(switch_id), flush=True)
     print("[INFO] Switch MAC", ':'.join(f'{b:02x}' for b in get_switch_mac()))
 
-    priority, VLAN_table = parse_vlan_data(interfaces, f"configs/switch{switch_id}.cfg")
+    priority, VLAN_table = read_switch_config(switch_id, interfaces)
 
     port_type = {}
     port_state = {}
-    
-    for i in interfaces:
-        if VLAN_table[i] == 'T':
-            port_type[i] = 'BLOCKING'
-            port_state[i] = 'BLOCKING'
     
     own_bridge_ID = priority
     root_bridge_ID = own_bridge_ID
     root_path_cost = 0
 
-    if own_bridge_ID == root_bridge_ID:
-        for i in interfaces:
-            if VLAN_table[i] == 'T':
-                port_type[i] = 'DESIGNATED'
-                port_state[i] = 'LISTENING'
+    for i in interfaces:
+        if VLAN_table[i] == 'T':
+            port_type[i] = 'DESIGNATED'
+            port_state[i] = 'LISTENING'
 
     # Create and start a new thread that deals with sending BDPU
     t = threading.Thread(target=send_bdpu_every_sec, args=(is_root, interfaces, own_bridge_ID, VLAN_table))
@@ -149,17 +142,22 @@ def main():
 
         print("Received frame of size {} on interface {}".format(length, interface), flush=True)
 
+        # CHeck if BDPU packet arrived
         if dest_mac == '01:80:c2:00:00:00':
+
+            # Extract relevant data form header
             bpdu_root_bridge = int.from_bytes(data[14:16], byteorder='big')
             bpdu_sender_bridge = int.from_bytes(data[16:18], byteorder = 'big')
             bpdu_cost = int.from_bytes(data[18:], byteorder='big')
 
+            # We found a better match for root
             if bpdu_root_bridge < root_bridge_ID:
                 root_bridge_ID = bpdu_root_bridge
                 root_path_cost = bpdu_cost + 10
                 root_port = interface
                 is_root = False
 
+                # Set all trunks to blocking except root port
                 if root_bridge_ID != own_bridge_ID:
                     for i in interfaces:
                         if VLAN_table[i] == 'T' and i != root_port:
@@ -168,6 +166,7 @@ def main():
                 if port_state[root_port] == 'BLOCKING':
                     port_state[root_port] = 'LISTENING'
                 
+                # Resend BPDU with new root metadata
                 new_bpdu = build_bdpu_ether(bpdu_root_bridge, own_bridge_ID, root_path_cost)
 
                 for i in interfaces:
@@ -175,29 +174,32 @@ def main():
                         send_to_link(i, len(new_bpdu), new_bpdu)
             
             elif bpdu_root_bridge == root_bridge_ID:
-                sender_path_cost = root_path_cost + 10
 
+                # Check if we found a shorter path to root
                 for i in interfaces:
-                    if i == interface and sender_path_cost < root_path_cost:
-                        root_path_cost = sender_path_cost
-                    elif i != interface and sender_path_cost > root_path_cost:
+                    if i == interface and bpdu_cost + 10 < root_path_cost:
+                        root_path_cost = bpdu_cost + 10
+
+                    # Set i as a designated port
+                    elif i != interface and bpdu_cost > root_path_cost:
                         if VLAN_table[i] == 'T' and port_type[i] != 'DESIGNATED':
-                            port_type[i] = 'DESIGNATED'
-                            port_state[i] = 'LISTENING'
+                            port_type[i], port_state[i] = 'DESIGNATED', 'LISTENING'
             
-            elif bpdu_sender_bridge == root_bridge_ID:
+            # We found a loop so we close all other ports
+            elif bpdu_sender_bridge == own_bridge_ID:
                 for i in interfaces:
                     if i != interface:
                         port_type[i], port_state[i] = 'BLOCKING', 'BLOCKING'
             
+            # Set all trunks to designated if we are root and skip to next iteration
             if own_bridge_ID == root_bridge_ID:
                 for i in interfaces:
                     if VLAN_table[i] == 'T':
-                        port_type[i] = 'DESIGNATED'
-                        port_state[i] = 'LISTENING'
+                        port_type[i], port_state[i] = 'DESIGNATED', 'LISTENING'
 
             continue
 
+        # Add VLAN tag if missing
         if vlan_id == -1:
             vlan_id = VLAN_table[interface]
             frame = data[0:12] + create_vlan_tag(vlan_id) + data[12:]
@@ -205,11 +207,11 @@ def main():
         else:
             frame = data
 
-        # TODO: Implement forwarding with learning
 
         if src_mac not in MAC_table:
             MAC_table[src_mac] = interface
 
+        # Send to trunk only if listening and to hosts only if correct VLAN id
         if is_unicast(dest_mac_byte) and dest_mac in MAC_table:
             if VLAN_table[MAC_table[dest_mac]] == 'T' and port_state[MAC_table[dest_mac]] == 'LISTENING':
                 send_to_link(MAC_table[dest_mac], length, frame)
@@ -219,6 +221,7 @@ def main():
                 send_to_link(MAC_table[dest_mac], length-4, untagged)
 
         else:
+            # Send multicast
             for i in interfaces:
                 if i != interface:
                     if VLAN_table[i] == 'T' and port_state[i] == 'LISTENING':
@@ -227,12 +230,6 @@ def main():
                     elif VLAN_table[i] == vlan_id:
                         untagged = frame[0:12] + frame[16:]
                         send_to_link(i, length-4, untagged)
-
-        # TODO: Implement VLAN support
-        # TODO: Implement STP support
-
-        # data is of type bytes.
-        # send_to_link(i, length, data)
 
 if __name__ == "__main__":
     main()
